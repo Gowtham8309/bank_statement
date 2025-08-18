@@ -98,7 +98,7 @@ Example (PowerShell):
 
 $env:GOOGLE_CLOUD_PROJECT="verdant-copilot-467518-c1"
 $env:VERTEX_LOCATION="us-central1"
-$env:GOOGLE_APPLICATION_CREDENTIALS="C:\Users\bevar\bank\service-key.json"
+$env:GOOGLE_APPLICATION_CREDENTIALS='/abs/path/verdant-copilot-467518-c1-251370377dd2.json'
 $env:USE_GEMINI="1"
 $env:GOOGLE_API_KEY="AIzaSyXXXXXXX"
 
