@@ -1,26 +1,30 @@
+# Core UI + API
 streamlit>=1.34.0
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
 
-# PDF parsing
+# PDF processing
 pdfplumber>=0.11.0
 PyMuPDF>=1.24.8
 
-# Data wrangling
+# Data utils
 pandas>=2.2.2
 numpy>=1.26.4
 python-dateutil>=2.9.0.post0
 
-# Google Vertex AI (Gemini on Vertex)
-google-cloud-aiplatform>=1.66.0  # includes `vertexai` module
+# Google + Gemini
+google-cloud-aiplatform>=1.66.0
 google-auth>=2.30.0
+google-generativeai>=0.8.5
+protobuf>=4.25.3,<5.0.0  # ✅ fix version conflict
 
-# Optional direct Gemini client (not required if using Vertex AI exclusively)
-google-generativeai>=0.7.2
-
-# Utilities
-pydantic>=2.7.0
+# Environment + utils
 python-dotenv>=1.0.1
 tqdm>=4.66.4
-git+https://github.com/landing-ai/agentic-doc.git
+
+# Agentic Doc (install from GitHub)
+git+https://github.com/landing-ai/agentic-doc.git@main
+
+# Optional (logging / debugging)
+rich>=14.0.0
