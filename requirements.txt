@@ -1,31 +1,16 @@
-# Core UI + API
 streamlit>=1.34.0
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
-
-# PDF processing
 pdfplumber>=0.11.0
 PyMuPDF>=1.24.8
-
-# Data utils
 pandas>=2.2.2
 numpy>=1.26.4
 python-dateutil>=2.9.0.post0
-
-# Google + Gemini
 google-cloud-aiplatform>=1.66.0
 google-auth>=2.30.0
 google-generativeai>=0.8.5
-protobuf>=6.31.1,<7.0.0
-
-
-# Environment + utils
 python-dotenv>=1.0.1
 tqdm>=4.66.4
-
-# Agentic Doc (install from GitHub)
-git+https://github.com/landing-ai/agentic-doc.git@main
-
-# Optional (logging / debugging)
 rich>=14.0.0
+git+https://github.com/landing-ai/agentic-doc.git@main
