@@ -8,5 +8,9 @@ google-generativeai==0.8.5
 protobuf==5.29.5
 pillow>=11,<12
 pyarrow==21.0.0
+fastapi
+uvicorn[standard]
+gunicorn
+
 # Optional (only if you plan to use Agentic-Doc for details; avoid if protobuf conflicts)
 # git+https://github.com/landing-ai/agentic-doc.git@main
