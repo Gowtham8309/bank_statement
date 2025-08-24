@@ -2,13 +2,18 @@ import os, math, traceback, logging
 from typing import Any
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse
 import uvicorn
 
 # ---------- Logging & Debug ----------
 DEBUG = os.getenv("DEBUG", "1") not in ("0", "false", "False", "")
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
 logger = logging.getLogger("bank-extractor")
+
+# Quiet very-chatty libraries
+logging.getLogger("python_multipart").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.error").setLevel(logging.INFO)
+logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 
 # ---------- Optional deps ----------
 try:
@@ -20,7 +25,7 @@ try:
 except Exception:
     pd = None
 
-# ---------- Import pipeline (rename 'pipeline (8).py' to 'pipeline.py') ----------
+# ---------- Import pipeline ----------
 PIPELINE_AVAILABLE = True
 _import_err = None
 try:
@@ -43,34 +48,25 @@ def _is_nan_or_inf(x: Any) -> bool:
     return False
 
 def _sanitize_json(obj: Any) -> Any:
-    # Scalars
     if _is_nan_or_inf(obj):
         return None
 
-    # numpy → Python
     if np is not None:
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return float(obj) if math.isfinite(float(obj)) else None
-        if isinstance(obj, (np.bool_,)):
-            return bool(obj)
-        if isinstance(obj, (np.ndarray,)):
-            return [_sanitize_json(x) for x in obj.tolist()]
+        if isinstance(obj, (np.integer,)): return int(obj)
+        if isinstance(obj, (np.floating,)): return float(obj) if math.isfinite(float(obj)) else None
+        if isinstance(obj, (np.bool_,)): return bool(obj)
+        if isinstance(obj, (np.ndarray,)): return [_sanitize_json(x) for x in obj.tolist()]
 
-    # pandas → JSON safe
     if pd is not None:
         if isinstance(obj, pd.DataFrame):
             return _sanitize_json(obj.where(pd.notnull(obj), None).to_dict(orient="records"))
         if isinstance(obj, pd.Series):
             return _sanitize_json(obj.where(pd.notnull(obj), None).to_dict())
 
-    # containers
     if isinstance(obj, dict):
         return {k: _sanitize_json(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
         return [_sanitize_json(v) for v in obj]
-
     return obj
 
 # ---------- FastAPI app ----------
@@ -79,11 +75,13 @@ app = FastAPI(title="Bank Statement Extractor API", version="1.0.0")
 # CORS (open for demo)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
+
+@app.get("/")
+def root():
+    # Avoid 404 spam from bots; useful landing
+    return RedirectResponse("/docs")
 
 @app.get("/health")
 def health():
@@ -115,10 +113,7 @@ async def extract(
         else:
             raise RuntimeError("Expected `extract_from_pdf` or `process_pdf_bytes` in pipeline.py")
 
-        # Make JSON-safe
         result = _sanitize_json(result)
-
-        # Extra safety: common key “transactions” being a DataFrame or has NaN
         if isinstance(result, dict) and "transactions" in result:
             result["transactions"] = _sanitize_json(result["transactions"])
 
@@ -136,4 +131,5 @@ async def extract(
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False, log_level="debug" if DEBUG else "info")
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False,
+                log_level="debug" if DEBUG else "info")
