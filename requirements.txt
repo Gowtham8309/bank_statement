@@ -8,4 +8,3 @@ google-generativeai==0.8.5
 protobuf==5.29.5
 pillow>=11,<12
 pyarrow==21.0.0
-# IMPORTANT: no agentic-doc here
