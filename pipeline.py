@@ -1,13 +1,15 @@
 """
-Bank Statement Extraction Pipeline (fixed)
-- Transactions:
-    1) Vision Agent (agentic-doc)  → structured rows
-    2) pdfplumber                  → tables
-    3) HDFC-like text parser       → wrapped narrations
-    4) Regex header split          → generic
-    5) Gemini LLM fallback (STRICT JSON) → only if everything else fails
+Bank Statement Extraction Pipeline (Gemini-first)
+
+- Transactions (tables):
+    1) Gemini LLM (STRICT JSON)  → primary
+    2) pdfplumber                → fallback
+    3) HDFC-like text parser     → fallback (wrapped narrations)
+    4) Regex header split        → fallback (generic)
+    5) Vision Agent              → optional (if you enable it)
+
 - Details:
-    Agentic-Doc (guided schema) → Gemini JSON → Heuristic | field-wise merge + validation
+    Agentic-Doc (optional) → Gemini JSON → Heuristic  |  field-wise merge + validation
 """
 
 from __future__ import annotations
@@ -22,18 +24,13 @@ from typing import List, Dict, Optional, Tuple, Iterable, Any
 import pandas as pd
 from dateutil.parser import parse as dateparse
 
-# ---------- Inline defaults (real env vars override) ----------
-INLINE_ENV = {
-    "VISION_AGENT_API_KEY": "d2U3aDNlMnY4NXF6aHVwc2JndmFsOlFGU2lVSEljRzJiRjZaNURqRGZMN1IzZmxZV09LdTls",
-    "USE_AGENTIC_DOC": "1",
-    "USE_VISION_AGENT_TX": "1",        # Vision Agent for transactions first
-    "GOOGLE_API_KEY": "AIzaSyCXIN0sGxkhQmfJwFGrYYqb6IKRCU3WLwE",
-    "GEMINI_MODEL": "gemini-2.5-pro",
-    "USE_GEMINI": "1",
-    "USE_LLM_TABLE_FALLBACK": "1",
-}
-for k, v in INLINE_ENV.items():
-    os.environ.setdefault(k, v)
+# ------------------------------------------------------------------
+# Safe defaults (real values should come from env or Streamlit secrets)
+# ------------------------------------------------------------------
+os.environ.setdefault("USE_GEMINI", "1")
+os.environ.setdefault("USE_LLM_TABLES_ONLY", "1")   # run Gemini first; skip other extractors if it succeeds
+os.environ.setdefault("USE_VISION_AGENT_TX", "0")   # optional
+os.environ.setdefault("USE_AGENTIC_DOC", "0")       # optional
 
 # ---------- PDF (no external binaries) ----------
 try:
@@ -58,7 +55,7 @@ try:
 except Exception:
     genai = None
 
-# ---------- Agentic-Doc ----------
+# ---------- Agentic-Doc (optional) ----------
 try:
     from pydantic import BaseModel, Field
     from agentic_doc.parse import parse as agentic_parse
@@ -101,11 +98,9 @@ def _phone_prefer_contact(text: str) -> Optional[str]:
     """Prefer 10-digit Indian mobile; ignore 1800/helplines and weird counters."""
     if not text:
         return None
-    # 1) Explicit 'contact|phone|mobile' labeled lines
     m = re.search(r"(?:contact|phone|mobile)[:\s]*\+?91?[-\s]?([6-9]\d{9})", text, flags=re.I)
     if m:
         return m.group(1)
-    # 2) Any 10-13 digits -> pick 10-digit starting with 6-9; ignore 1800 etc.
     for m2 in re.finditer(r"\b(\+?91[-\s]?)?([6-9]\d{9})\b", text):
         cand = m2.group(2)
         if cand and not cand.startswith(("1800", "1860", "1008", "00000")):
@@ -128,6 +123,9 @@ def _to_amount(s: Any) -> Optional[float]:
     s = str(s).replace(",", "").replace("₹", "").strip()
     if not s:
         return None
+    # Treat dashes as nulls
+    if re.fullmatch(r"[-–—]+", s):
+        return None
     mul = -1.0 if s.upper().endswith("DR") else 1.0
     s = re.sub(r"(CR|DR)$", "", s, flags=re.I).strip()
     try:
@@ -135,8 +133,7 @@ def _to_amount(s: Any) -> Optional[float]:
     except Exception:
         return None
 
-# ---------- Noise control for details ----------
-# ---------- Noise guards & label utilities (replace your current versions) ----------
+# ---------- Noise guards & label utilities ----------
 
 _NOISE_TOKENS = {
     "address": [
@@ -163,7 +160,7 @@ _LABEL_PAT = re.compile(
 def _strip_noise_tokens(text: Optional[str], kind: str) -> Optional[str]:
     if not text:
         return None
-    s = " ".join(str(text).split())  # collapse whitespace
+    s = " ".join(str(text).split())
     for t in _NOISE_TOKENS.get(kind, []):
         s = re.sub(rf"\b{re.escape(t)}\b", "", s, flags=re.I)
     s = re.sub(r"\s{2,}", " ", s).strip(" ,;-:\n\t")
@@ -173,27 +170,23 @@ def _clean_name(name: Optional[str]) -> Optional[str]:
     if not name:
         return None
     s = str(name).strip()
-    s = re.sub(r"^[\.\-:•\s]+", "", s)          # drop leading punctuation
-    s = re.sub(r"[\.,:;•\-\s]+$", "", s)        # drop trailing punctuation
+    s = re.sub(r"^[\.\-:•\s]+", "", s)
+    s = re.sub(r"[\.,:;•\-\s]+$", "", s)
     s = re.sub(r"^(mr|mrs|ms|miss|smt|dr)\.?\s+", "", s, flags=re.I)
-    s = re.sub(r"[^A-Za-z\s\.'-]", " ", s)      # letters + name chars
+    s = re.sub(r"[^A-Za-z\s\.'-]", " ", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
     if not s:
         return None
-    # kill one-word junk like "Count"
     if s.lower() in _NOISE_TOKENS["name_bad"]:
         return None
-    # must have at least one 2+ letter word
     if not any(len(w) >= 2 for w in s.split()):
         return None
     return s.title()
 
 def _clean_address_like(s: Optional[str]) -> Optional[str]:
-    """Remove labels, metrics, and numeric-only tokens from address-like fields."""
     s = _strip_noise_tokens(s, "address")
     if not s:
         return None
-    # drop embedded 'Address :' labels and metric fragments
     s = re.sub(_LABEL_PAT, "", s).strip()
     parts = [p.strip() for p in re.split(r"[,\n;]+", s) if p.strip()]
     keep: list[str] = []
@@ -201,7 +194,6 @@ def _clean_address_like(s: Optional[str]) -> Optional[str]:
     for p in parts:
         if metric_re.search(p):
             continue
-        # keep segments that contain letters (addresses) — drop those that are mostly numeric like "2,620.27" or "5"
         letters = sum(ch.isalpha() for ch in p)
         digits  = sum(ch.isdigit() for ch in p)
         if letters == 0 and digits > 0:
@@ -215,7 +207,6 @@ def _clean_branch_addr(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
     s = re.sub(_LABEL_PAT, "", s).strip()
-    # remove stray repeated "Address :" inside the value and collapse double colons
     s = re.sub(r"\bAddress\s*:\s*", "", s, flags=re.I)
     s = re.sub(r":\s*:", ":", s)
     s = re.sub(r"\s{2,}", " ", s).strip(" ,;-")
@@ -236,11 +227,9 @@ def _derive_name_from_email(email: Optional[str]) -> Optional[str]:
     if not e:
         return None
     local = e.split("@", 1)[0]
-    # split on non-letters and re-title
     tokens = [t for t in re.split(r"[^a-zA-Z]+", local) if len(t) >= 2]
     if len(tokens) >= 2:
         name = " ".join(tokens).title()
-        # guard against generic usernames
         if name.lower() not in _NOISE_TOKENS["name_bad"]:
             return name
     return None
@@ -283,42 +272,20 @@ def compute_doc_profile(path: str) -> Dict[str, Any]:
     }
 
 
-# ======================= Stage 2: Transactions (algorithmic-first) =======================
+# ======================= Stage 2: Transactions =======================
 
-# ---- 2.0 Vision Agent table extraction ----
+# ---- Optional Agentic-Doc schema for transactions ----
 if _HAS_AGENTIC:
     class _TxnRow(BaseModel):  # type: ignore[misc]
-        date: Optional[str] = Field(
-            default=None,
-            description="Transaction date only (e.g., 12/08/2025 or 12-08-2025). Do NOT include time.",
-        )
-        description: Optional[str] = Field(
-            default=None,
-            description="Narration/description. Merge wrapped lines. No headers.",
-        )
-        ref: Optional[str] = Field(default=None, description="Reference/Cheque/UTR number if present.")
-        debit: Optional[str] = Field(
-            default=None,
-            description="Withdrawal amount as a plain number with two decimals (e.g., 2500.00). No currency or commas. Empty if credit.",
-        )
-        credit: Optional[str] = Field(
-            default=None,
-            description="Deposit/credit amount as a plain number with two decimals. Empty if debit.",
-        )
-        balance: Optional[str] = Field(
-            default=None,
-            description="Running balance after the transaction as a plain number with two decimals.",
-        )
+        date: Optional[str] = Field(default=None)
+        description: Optional[str] = Field(default=None)
+        ref: Optional[str] = Field(default=None)
+        debit: Optional[str] = Field(default=None)
+        credit: Optional[str] = Field(default=None)
+        balance: Optional[str] = Field(default=None)
 
     class _TxnOut(BaseModel):  # type: ignore[misc]
-        transactions: List[_TxnRow] = Field(
-            default_factory=list,
-            description=(
-                "All transaction rows in order as they appear in the bank statement. "
-                "Skip headers and blank lines. Use 'debit' for withdrawals and 'credit' for deposits. "
-                "If a field is missing, leave it blank."
-            ),
-        )
+        transactions: List[_TxnRow] = Field(default_factory=list)
 else:
     class _TxnOut(object):  # dummy
         pass
@@ -332,7 +299,6 @@ def _agentic_transactions_ok(df: pd.DataFrame) -> bool:
 def extract_transactions_with_agentic_doc(pdf_path: str) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
     if not _HAS_AGENTIC or agentic_parse is None:
         return pd.DataFrame(), {"anomalies": ["agentic-doc not available"]}, False
-
     pages = agentic_parse(pdf_path, extraction_model=_TxnOut)
     rows: List[Dict[str, Optional[str]]] = []
     for p in pages:
@@ -349,12 +315,10 @@ def extract_transactions_with_agentic_doc(pdf_path: str) -> Tuple[pd.DataFrame, 
                 "Credit": getattr(r, "credit", None),
                 "Balance": getattr(r, "balance", None),
             })
-
     df = pd.DataFrame(rows, columns=["Date", "Description", "Ref", "Debit", "Credit", "Balance"]).dropna(how="all")
     if df.empty:
         return df, {"coverage_hits": 0, "anomalies": ["no rows from Vision Agent"]}, False
 
-    # Normalize
     if "Date" in df.columns:
         def _norm_date(x):
             if not x:
@@ -371,15 +335,11 @@ def extract_transactions_with_agentic_doc(pdf_path: str) -> Tuple[pd.DataFrame, 
     if not _agentic_transactions_ok(df):
         return df, {"coverage_hits": len(df), "anomalies": ["Vision Agent rows below quality threshold"]}, False
 
-    report = {
-        "coverage_hits": int(len(df)),
-        "anomalies": [],
-        "pages_spanned": [],
-        "algorithmic_success": True,
-    }
+    report = {"coverage_hits": int(len(df)), "anomalies": [], "pages_spanned": [], "algorithmic_success": True}
     return df, report, True
 
-# ---- 2.1 pdfplumber (structure-aware) ----
+
+# ---- 2b. pdfplumber fallback ----
 def _parse_transactions_pdfplumber(pdf_path: str) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
     if not _HAS_PDFPLUMBER:
         return pd.DataFrame(), {"anomalies": ["pdfplumber not available"]}, False
@@ -442,7 +402,8 @@ def _parse_transactions_pdfplumber(pdf_path: str) -> Tuple[pd.DataFrame, Dict[st
     }
     return df, report, report["algorithmic_success"]
 
-# ---- 2.2 HDFC-text parser (wrapped narration) ----
+
+# ---- 2c. HDFC-like wrapped narration fallback ----
 def _parse_transactions_hdfc_like(page_texts: Iterable[str]) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
     raw_lines: List[str] = []
     for page in page_texts:
@@ -533,105 +494,15 @@ def _parse_transactions_hdfc_like(page_texts: Iterable[str]) -> Tuple[pd.DataFra
               "algorithmic_success": len(df) >= 5, "anomalies": []}
     return df, report, report["algorithmic_success"]
 
-# ---- 2.3 legacy regex fallback ----
-def _parse_transactions_regex(page_texts: Iterable[str]) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
-    header_line = None
-    header_page_index = 0
-    header_pattern = re.compile(r"(date|narration|description|debit|credit|balance)", re.I)
 
-    for pidx, text in enumerate(page_texts):
-        for line in text.splitlines():
-            if header_pattern.search(line):
-                header_line = line
-                header_page_index = pidx
-                break
-        if header_line:
-            break
-
-    rows: List[List[str]] = []
-    pages_spanned: List[int] = []
-    if header_line:
-        split_positions = [m.start() for m in re.finditer(r"\s{2,}", header_line)]
-        col_positions = [0]
-        for pos in split_positions:
-            if pos - col_positions[-1] >= 2:
-                col_positions.append(pos)
-        col_positions.append(len(header_line))
-
-        header_cols: List[str] = []
-        for i in range(len(col_positions) - 1):
-            seg = header_line[col_positions[i]:col_positions[i + 1]].strip()
-            header_cols.append(seg or f"Column{i+1}")
-
-        for pidx in range(header_page_index, len(page_texts)):
-            for line in page_texts[pidx].splitlines():
-                if len(line) < 10 or line.count(" ") < 2:
-                    continue
-                fields: List[str] = []
-                for i in range(len(col_positions) - 1):
-                    seg = line[col_positions[i]:col_positions[i + 1]].strip()
-                    fields.append(seg)
-                if fields and (_looks_like_date(fields[0]) or re.search(r"\d", " ".join(fields[-3:]))):
-                    rows.append(fields)
-                    pages_spanned.append(pidx + 1)
-
-        if rows:
-            df = pd.DataFrame(rows)
-            if len(header_cols) < df.shape[1]:
-                header_cols += [f"Column{i+1}" for i in range(len(header_cols), df.shape[1])]
-            df.columns = header_cols[: df.shape[1]]
-
-            rename_map = {}
-            for c in df.columns:
-                lc = c.lower()
-                if "date" in lc and "value" not in lc:
-                    rename_map[c] = "Date"
-                elif any(k in lc for k in ["narration", "descr", "particular"]):
-                    rename_map[c] = "Description"
-                elif "ref" in lc or "chq" in lc or "utr" in lc:
-                    rename_map[c] = "Ref"
-                elif any(k in lc for k in ["debit", "withdrawal", "dr"]):
-                    rename_map[c] = "Debit"
-                elif any(k in lc for k in ["credit", "deposit", "cr"]):
-                    rename_map[c] = "Credit"
-                elif "balance" in lc or "bal" in lc:
-                    rename_map[c] = "Balance"
-            df = df.rename(columns=rename_map)
-            df = df.loc[:, ~df.columns.duplicated()]
-
-            if "Date" in df.columns:
-                df["Date"] = df["Date"].apply(lambda x: _to_iso_date(x) if x and _looks_like_date(str(x)) else None)
-            if "Debit" in df.columns:
-                df["Debit"] = df["Debit"].apply(_to_amount)
-            if "Credit" in df.columns:
-                df["Credit"] = df["Credit"].apply(_to_amount)
-            if "Balance" in df.columns:
-                df["Balance"] = df["Balance"].apply(_to_amount)
-
-            coverage_hits = len(df.index)
-            algorithmic_success = coverage_hits >= 5
-            report = {
-                "coverage_hits": coverage_hits,
-                "total_candidates": len(rows),
-                "pages_spanned": sorted(set(pages_spanned)),
-                "algorithmic_success": algorithmic_success,
-                "anomalies": [] if algorithmic_success else [f"Unexpected number of columns detected: {df.shape[1]}"],
-            }
-            return df, report, algorithmic_success
-
-    empty = pd.DataFrame(columns=["Date", "Description", "Ref", "Debit", "Credit", "Balance"])
-    report = {"coverage_hits": 0, "total_candidates": 0, "pages_spanned": [], "algorithmic_success": False, "anomalies": ["No table header found"]}
-    return empty, report, False
-
-
-# ======================= Stage 2b: LLM fallback for tables (Gemini) =======================
+# ======================= Stage 2b: Gemini tables (PRIMARY) =======================
 
 def _surface_table_like_regions(page_texts: List[str]) -> str:
     """Grab lines near headers and following content; strip summary rows like 'Cr Count'."""
     buf: List[str] = []
-    header_re = re.compile(r"(date|narration|description|debit|credit|balance)", re.I)
+    header_re = re.compile(r"(date|narration|details?|description|debit|credit|balance|ref\s*no)", re.I)
     skip_re = re.compile(r"(cr count|debits|credits|closing bal|closing balance|totals?)", re.I)
-    for text in page_texts[:3]:  # first 3 pages are enough for LLM fallback
+    for text in page_texts[:8]:  # scan a few pages; statements can span many
         lines = text.splitlines()
         capture = False
         for ln in lines:
@@ -643,21 +514,19 @@ def _surface_table_like_regions(page_texts: List[str]) -> str:
                 if skip_re.search(ln):
                     continue
                 buf.append(ln)
-                # stop after a big block to keep prompt small
-                if len(buf) > 400:
+                if len(buf) > 1200:
                     break
-    return "\n".join(buf[:1200])
+    return "\n".join(buf[:2000])
 
 def _gemini_json_call(system_prompt: str, user_prompt: str, model_name: Optional[str] = None, retries: int = 2) -> str:
     if os.getenv("USE_GEMINI", "0") != "1" or genai is None:
         return "{}"
-    api_key = 'AIzaSyCXIN0sGxkhQmfJwFGrYYqb6IKRCU3WLwE'
+    api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         return "{}"
     model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
     try:
         genai.configure(api_key=api_key)
-        # Try with system_instruction & JSON mime
         try:
             model = genai.GenerativeModel(
                 model_name,
@@ -681,24 +550,26 @@ def _gemini_json_call(system_prompt: str, user_prompt: str, model_name: Optional
         return "{}"
 
 def extract_transactions_with_llm(page_texts: List[str]) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
-    """LLM fallback ONLY if algorithmic failed."""
+    """Gemini as the PRIMARY extractor."""
     table_blob = _surface_table_like_regions(page_texts)
     if not table_blob or len(table_blob) < 40:
         return pd.DataFrame(), {"anomalies": ["no table-like text for LLM"]}, False
 
     system = (
-        "You convert raw bank-statement rows into STRICT JSON. "
-        "Skip headers, totals, and summaries like 'Cr Count', 'Debits', 'Credits', 'Closing Bal'. "
-        "Do not invent values."
+        "You are a bank statement table parser. Return STRICT JSON only.\n"
+        "Treat '-', '–', '—' as null. Parse dates like '12 AUG 2025 10.49AM' to ISO 'YYYY-MM-DD' (ignore time).\n"
+        "Map headers/synonyms to exactly: Date, Description, Ref, Debit, Credit, Balance.\n"
+        "For each row exactly one of Debit or Credit must be a number; the other must be null.\n"
+        "Skip headers and any totals/summary rows (e.g., 'Cr Count', 'Totals', 'Closing Balance')."
     )
     schema = {
         "transactions": [
             {
-                "Date": "YYYY-MM-DD (ISO date; parse dd/mm/yy or dd-mm-yyyy, etc.)",
+                "Date": "YYYY-MM-DD",
                 "Description": "string",
                 "Ref": "string or null",
-                "Debit": "number or null (withdrawals); never with 'DR/CR'",
-                "Credit": "number or null (deposits); never with 'DR/CR'",
+                "Debit": "number or null",
+                "Credit": "number or null",
                 "Balance": "number or null"
             }
         ]
@@ -706,13 +577,8 @@ def extract_transactions_with_llm(page_texts: List[str]) -> Tuple[pd.DataFrame, 
     user = (
         "Return ONLY a JSON object with key 'transactions' exactly like this schema:\n"
         + json.dumps(schema, indent=2)
-        + "\nRules:\n"
-          "- One of Debit or Credit must be null for each row.\n"
-          "- Combine wrapped descriptions into one line.\n"
-          "- Ignore non-row text.\n"
-          "- No extra keys, no prose.\n\n"
-        "RAW TABLE TEXT:\n"
-        f"{table_blob}"
+        + "\nRAW TABLE TEXT:\n"
+        + table_blob
     )
     out = _gemini_json_call(system, user)
     try:
@@ -729,21 +595,34 @@ def extract_transactions_with_llm(page_texts: List[str]) -> Tuple[pd.DataFrame, 
         debit = r.get("Debit")
         credit = r.get("Credit")
         balance = r.get("Balance")
-        # normalize
         d_iso = _to_iso_date(d) if d and _looks_like_date(str(d)) else None
+
+        def _dash_none(x):
+            if x is None: return None
+            s = str(x).strip().replace("–","-").replace("—","-")
+            return None if re.fullmatch(r"-+", s) else s
+
         parsed.append({
             "Date": d_iso,
             "Description": (desc or None),
             "Ref": (ref or None),
-            "Debit": _to_amount(debit),
-            "Credit": _to_amount(credit),
-            "Balance": _to_amount(balance),
+            "Debit": _to_amount(_dash_none(debit)),
+            "Credit": _to_amount(_dash_none(credit)),
+            "Balance": _to_amount(_dash_none(balance)),
         })
 
     df = pd.DataFrame(parsed, columns=["Date","Description","Ref","Debit","Credit","Balance"]).dropna(how="all")
     df = df[df["Date"].notna() & df["Description"].notna()]
-    ok = len(df) >= 5
-    report = {"coverage_hits": len(df), "anomalies": [] if ok else ["too few rows"], "algorithmic_success": ok, "llm_used_for_tables": True}
+
+    # basic quality: most rows should have at least one numeric
+    num_ok = False if df.empty else (df[["Debit","Credit","Balance"]].notna().any(axis=1)).mean() >= 0.6
+    ok = len(df) >= 3 and num_ok
+    report = {
+        "coverage_hits": int(len(df)),
+        "anomalies": [] if ok else ["too few rows or no numeric values"],
+        "algorithmic_success": ok,
+        "llm_used_for_tables": True
+    }
     return df, report, ok
 
 
@@ -751,34 +630,13 @@ def extract_transactions_with_llm(page_texts: List[str]) -> Tuple[pd.DataFrame, 
 
 if _HAS_AGENTIC:
     class _BankFields(BaseModel):  # type: ignore[misc]
-        name: Optional[str] = Field(
-            default=None,
-            description="Account holder full name exactly as printed (no titles like Mr/Ms, no labels)."
-        )
-        address: Optional[str] = Field(
-            default=None,
-            description="Postal address lines for the account holder only. Exclude banking terms (Drawing Power, IFSC, Overdraft, etc.)."
-        )
-        contact_number: Optional[str] = Field(
-            default=None,
-            description="Primary phone number for the holder. Return 10 digits only if Indian."
-        )
-        email: Optional[str] = Field(
-            default=None,
-            description="Email address of the account holder (if present)."
-        )
-        account_number: Optional[str] = Field(
-            default=None,
-            description="Account number with 9–18 digits (no spaces)."
-        )
-        ifsc: Optional[str] = Field(
-            default=None,
-            description="IFSC in format 4 letters + 0 + 6 alphanumerics, e.g., HDFC0001234."
-        )
-        branch_address: Optional[str] = Field(
-            default=None,
-            description="Name/address of the branch only. Exclude labels like 'Account Number' or 'Date'."
-        )
+        name: Optional[str] = Field(default=None)
+        address: Optional[str] = Field(default=None)
+        contact_number: Optional[str] = Field(default=None)
+        email: Optional[str] = Field(default=None)
+        account_number: Optional[str] = Field(default=None)
+        ifsc: Optional[str] = Field(default=None)
+        branch_address: Optional[str] = Field(default=None)
 else:
     class _BankFields(object):
         pass
@@ -815,7 +673,7 @@ def extract_details_with_agentic_doc(pdf_path: str) -> Tuple[Dict[str, Optional[
     ifsc  = _ifsc_ok(raw_ifsc) or _ifsc_ok(full_text or "")
     branch= _clean_branch_addr(raw_branch)
 
-    # If address is still too short, try header lines under the name
+    # If address is still short, look under the name line
     if (not addr or len(addr) < 8):
         try:
             with fitz.open(pdf_path) as _doc:
@@ -827,7 +685,6 @@ def extract_details_with_agentic_doc(pdf_path: str) -> Tuple[Dict[str, Optional[
         if v:
             addr = _clean_address_like(v)
         elif name:
-            # take next 3–5 lines after name, dropping metric/noise tokens
             for i, ln in enumerate(lines):
                 if name.split()[0].lower() in ln.lower():
                     bucket = []
@@ -859,7 +716,7 @@ def extract_details_with_agentic_doc(pdf_path: str) -> Tuple[Dict[str, Optional[
     return account_holder, bank_account, meta_out
 
 
-# ---- Gemini fallback for details (prompt strengthened) ----
+# ---- Gemini for details ----
 def call_gemini(prompt: str, model_name: str = None) -> str:
     if os.getenv("USE_GEMINI", "0") != "1" or genai is None:
         return "{}"
@@ -870,10 +727,7 @@ def call_gemini(prompt: str, model_name: str = None) -> str:
     try:
         genai.configure(api_key=api_key)
         try:
-            model = genai.GenerativeModel(
-                model_name,
-                generation_config={"response_mime_type": "application/json"}
-            )
+            model = genai.GenerativeModel(model_name, generation_config={"response_mime_type": "application/json"})
         except Exception:
             model = genai.GenerativeModel(model_name)
         resp = model.generate_content(prompt)
@@ -889,21 +743,19 @@ def surface_key_blobs(page_texts: List[str]) -> Dict[str, str]:
 
 def extract_details_with_llm(blobs: Dict[str, str]) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]], Dict]:
     system_rules = (
-        "You extract ONLY the following fields from bank-statement headers. "
-        "Ignore totals/metrics like 'Cr Count', 'Debits', 'Credits', 'Closing Bal', 'Statement of Account', etc. "
-        "Return STRICT JSON. If a field is missing, use null. Do not guess.\n"
+        "You extract ONLY these fields from a bank-statement header and return STRICT JSON.\n"
+        "Ignore totals/metrics like 'Cr Count', 'Debits', 'Credits', 'Closing Bal'.\n"
         "Schema:\n"
         "{\n"
         '  "account_holder": {"Name": "...", "Address": "...", "ContactNumber": "...", "Email": "..."},\n'
         '  "bank_account": {"AccountNumber": "...", "IFSC": "...", "BranchAddress": "..."}\n'
         "}\n"
         "Constraints:\n"
-        "- Name: Person/entity name only (no labels, no metrics).\n"
-        "- Address: Postal address only. Remove tokens like 'Drawing Power', 'IFSC', 'Overdraft', 'Account Description', 'Closing Bal'.\n"
-        "- ContactNumber: Indian 10-digit preferred.\n"
+        "- Name: Person/entity name only.\n"
+        "- Address: Postal address only (remove banking tokens).\n"
+        "- ContactNumber: Prefer Indian 10-digit.\n"
         "- IFSC: /^[A-Z]{4}0[A-Z0-9]{6}$/.\n"
-        "- AccountNumber: 9–18 digits only.\n"
-        "- BranchAddress: Branch/office address only."
+        "- AccountNumber: 9–18 digits.\n"
     )
     user = f"HEADER:\n{blobs.get('header','')}\n\nNEARBY:\n{blobs.get('nearby','')}\n\nReturn JSON only per schema."
     out = _gemini_json_call(system_rules, user)
@@ -928,6 +780,7 @@ def extract_details_with_llm(blobs: Dict[str, str]) -> Tuple[Dict[str, Optional[
     }
     return ah, ba, {"extracted_via": "gemini"}
 
+
 # ---- Heuristic fallback for details ----
 def extract_details_heuristic(page_texts: Iterable[str]) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]], Dict]:
     pages = list(page_texts)
@@ -951,7 +804,6 @@ def extract_details_heuristic(page_texts: Iterable[str]) -> Tuple[Dict[str, Opti
     ifsc  = _ifsc_ok(h_ifsc) or _ifsc_ok(text_all)
     branch= _clean_branch_addr(h_branch)
 
-    # If still no address, harvest 3–5 lines under a name-like line
     if (not addr or len(addr) < 8) and name:
         for i, ln in enumerate(lines):
             if name.split()[0].lower() in ln.lower():
@@ -1052,22 +904,22 @@ def process_pdf(path: str) -> Dict[str, Any]:
     doc_profile = compute_doc_profile(path)
     page_texts = extract_page_texts(path)
 
-    # ---- Stage 2: Transactions (Vision Agent → pdfplumber → HDFC → regex) ----
+    # ---- Stage 2: Transactions (Gemini-first) ----
     transactions_df = pd.DataFrame()
     table_report: Dict[str, Any] = {}
     algorithmic_success = False
     llm_used_for_tables = False
+    LLM_ONLY = os.getenv("USE_LLM_TABLES_ONLY", "0") == "1"
 
-    if os.getenv("USE_VISION_AGENT_TX", "1") == "1":
-        try:
-            tx_df_va, rep_va, ok_va = extract_transactions_with_agentic_doc(path)
-            if ok_va and not tx_df_va.empty:
-                transactions_df, table_report, algorithmic_success = tx_df_va, rep_va, True
-                llm_used_for_tables = False
-        except Exception as e:
-            table_report = {"anomalies": [f"Vision Agent error: {e}"]}
+    # 2a) LLM FIRST
+    if os.getenv("USE_GEMINI", "1") == "1":
+        tx_llm, rep_llm, ok_llm = extract_transactions_with_llm(page_texts)
+        if ok_llm and not tx_llm.empty:
+            transactions_df, table_report, algorithmic_success = tx_llm, rep_llm, True
+            llm_used_for_tables = True
 
-    if transactions_df.empty:
+    # 2b) If LLM failed and NOT LLM_ONLY, try algorithmic stack (pdfplumber → HDFC → regex → agentic optional)
+    if transactions_df.empty and not LLM_ONLY:
         if _HAS_PDFPLUMBER:
             try:
                 tx_df1, rep1, ok1 = _parse_transactions_pdfplumber(path)
@@ -1076,28 +928,28 @@ def process_pdf(path: str) -> Dict[str, Any]:
             except Exception as e:
                 table_report = {"anomalies": [f"pdfplumber error: {e}"]}
 
-    if transactions_df.empty:
-        tx_df_h, rep_h, ok_h = _parse_transactions_hdfc_like(page_texts)
-        if ok_h and not tx_df_h.empty:
-            transactions_df, table_report, algorithmic_success = tx_df_h, rep_h, True
+        if transactions_df.empty:
+            tx_df_h, rep_h, ok_h = _parse_transactions_hdfc_like(page_texts)
+            if ok_h and not tx_df_h.empty:
+                transactions_df, table_report, algorithmic_success = tx_df_h, rep_h, True
 
-    if transactions_df.empty:
-        tx_df2, rep2, ok2 = _parse_transactions_regex(page_texts)
-        if ok2 and not tx_df2.empty:
-            transactions_df, table_report, algorithmic_success = tx_df2, rep2, True
+        if transactions_df.empty:
+            tx_df2, rep2, ok2 = _parse_transactions_regex(page_texts)
+            if ok2 and not tx_df2.empty:
+                transactions_df, table_report, algorithmic_success = tx_df2, rep2, True
 
-    # ---- Stage 4: LLM fallback for tables (ONLY if algorithmic failed) ----
-    # ---- Stage 4: LLM fallback for tables (ONLY if algorithmic failed) ----
-    if transactions_df.empty and os.getenv("USE_LLM_TABLE_FALLBACK", "1") == "1":
-        tx_llm, rep_llm, ok_llm = extract_transactions_with_llm(page_texts)
-        if ok_llm and not tx_llm.empty:
-            transactions_df, table_report, algorithmic_success = tx_llm, rep_llm, True
-            llm_used_for_tables = True
+        if transactions_df.empty and os.getenv("USE_VISION_AGENT_TX", "0") == "1":
+            try:
+                tx_df_va, rep_va, ok_va = extract_transactions_with_agentic_doc(path)
+                if ok_va and not tx_df_va.empty:
+                    transactions_df, table_report, algorithmic_success = tx_df_va, rep_va, True
+            except Exception as e:
+                table_report = {"anomalies": [f"Vision Agent error: {e}"]}
+
     if algorithmic_success:
         logging.info(f"[TX] Parsed via: {'LLM' if llm_used_for_tables else 'Algorithmic'}; rows={len(transactions_df)}")
     else:
         logging.warning("[TX] No transactions parsed by any method")
-
 
     if not transactions_df.empty:
         transactions_df = transactions_df.loc[:, ~transactions_df.columns.duplicated()]
@@ -1115,8 +967,8 @@ def process_pdf(path: str) -> Dict[str, Any]:
     heur_ba: Dict[str, Optional[str]] = {}
     heur_meta: Dict[str, Any] = {}
 
-    # Agentic-Doc first
-    use_agentic = bool(os.getenv("VISION_AGENT_API_KEY")) and os.getenv("USE_AGENTIC_DOC", "1") == "1"
+    # Agentic-Doc for details (optional)
+    use_agentic = bool(os.getenv("VISION_AGENT_API_KEY")) and os.getenv("USE_AGENTIC_DOC", "0") == "1"
     if use_agentic:
         try:
             agentic_ah, agentic_ba, agentic_meta = extract_details_with_agentic_doc(path)
@@ -1183,16 +1035,11 @@ def process_pdf(path: str) -> Dict[str, Any]:
     }
 
     return unify_results(account_json, bank_json, transactions_df, provenance)
-# ---- API adapter (keep at the very bottom of pipeline.py) ----
-def run_pipeline(file_bytes: bytes, use_gemini: bool = True, llm_fallback: bool = True) -> dict:
-    """
-    API-facing canonical entrypoint expected by api.py.
 
-    - Accepts PDF bytes from FastAPI
-    - Writes to a temp file
-    - Calls your existing process_pdf(pdf_path)
-    - Returns the unified dict
-    """
+
+# ---- API adapters (keep at the bottom) ----
+def run_pipeline(file_bytes: bytes, use_gemini: bool = True, llm_fallback: bool = True) -> dict:
+    """API-facing canonical entrypoint."""
     import tempfile, os
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(file_bytes)
@@ -1207,18 +1054,14 @@ def run_pipeline(file_bytes: bytes, use_gemini: bool = True, llm_fallback: bool 
             os.unlink(tmp_path)
         except Exception:
             pass
-# ---------- Public entrypoints for server.py ----------
+
 def extract_from_pdf(file_bytes: bytes, **kwargs) -> dict:
-    """
-    Main entrypoint for API server. Accepts raw PDF bytes and returns structured result.
-    Ignores extra kwargs (llm_fallback, use_gemini, etc.).
-    """
+    """Main entrypoint for API server. Accepts raw PDF bytes and returns structured result."""
     import tempfile, os
     fd, tmp = tempfile.mkstemp(suffix=".pdf")
     try:
         with open(tmp, "wb") as f:
             f.write(file_bytes)
-        # ⚠️ Call process_pdf WITHOUT passing kwargs
         return process_pdf(tmp)
     finally:
         try: os.close(fd)
@@ -1226,11 +1069,9 @@ def extract_from_pdf(file_bytes: bytes, **kwargs) -> dict:
         try: os.unlink(tmp)
         except: pass
 
-
 def process_pdf_bytes(file_bytes: bytes, **kwargs) -> dict:
     """Alias for extract_from_pdf for compatibility."""
     return extract_from_pdf(file_bytes)
-
 
 def extract_from_path(path: str, **kwargs) -> dict:
     """For direct file path usage."""
