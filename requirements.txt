@@ -11,6 +11,8 @@ pyarrow==21.0.0
 fastapi
 uvicorn[standard]
 gunicorn
+python-multipart
+
 
 # Optional (only if you plan to use Agentic-Doc for details; avoid if protobuf conflicts)
 # git+https://github.com/landing-ai/agentic-doc.git@main
